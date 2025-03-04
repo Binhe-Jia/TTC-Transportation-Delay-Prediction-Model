@@ -1,0 +1,140 @@
+---
+title: "Datathon"
+format: html
+editor: visual
+---
+
+# Package & Data
+
+```{r, include=FALSE}
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(Metrics)
+library(glmnet)
+library(xgboost)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(ranger)
+library(DiagrammeR)
+library(Ckmeans.1d.dp)
+```
+
+```{r, warning=FALSE}
+data <- read.csv("streetcar-data.csv")
+data_pre = data
+data_pre <- separate(data_pre, Date, into = c("Date", "Month", "Year"), sep = "-")
+data_pre$Year = NULL
+data_pre$Vehicle = NULL
+```
+
+```{r}
+data_pre = data_pre %>% filter(Line != '')
+# factorization
+data_pre$Day = as.factor(data_pre$Day)
+data_pre$Line = as.factor(data_pre$Line)
+data_pre$Location = as.factor(data_pre$Location)
+data_pre$Incident = as.factor(data_pre$Incident)
+data_pre$Bound[data_pre$Bound == "8"] <- "B"
+data_pre$Bound[is.na(data_pre$Bound)] <- "A"
+data_pre$Bound = as.factor(data_pre$Bound)
+# numerization
+
+convert_to_minutes <- function(time_str) {
+  parts <- strsplit(time_str, ":")[[1]]
+  hours <- as.numeric(parts[1])
+  minutes <- as.numeric(parts[2])
+  return(hours * 60 + minutes)
+}
+
+data_pre$Time <- sapply(data_pre$Time, convert_to_minutes)
+```
+
+```{r}
+test_result = aov(Min.Delay~Day, data = data_pre)
+summary(test_result)
+```
+
+## Split data
+
+```{r}
+set.seed(321)
+n <- nrow(data_pre)
+train_indices = sample(1:n, size = 0.8 * n)
+train_set <- data_pre[train_indices, ]
+validation_set <- data_pre[-train_indices, ]
+```
+
+# Model
+
+## Random Forest
+
+```{r}
+Y = train_set$Min.Delay
+X = train_set
+X$Min.Delay = NULL
+model_ranger <- ranger(Y ~ ., data = X, importance = "impurity")
+# summary(model_ranger)
+validation_set_x = validation_set
+validation_set_x$Min.Delay = NULL
+predictions = predict(model_ranger, validation_set_x)
+importance = model_ranger$variable.importance
+rmse = sqrt(mse(validation_set$Min.Delay, predictions$predictions))
+```
+
+## Xgboost
+
+```{r}
+# One-hot-encoding
+resp = as.integer(Y)
+resp_t = validation_set$Min.Delay
+X_ohe = model.matrix(Min.Delay~.-1, data = train_set)
+X_t_ohe = model.matrix(Min.Delay~. -1, data = validation_set)
+dtrain = xgb.DMatrix(data = X_ohe, label = resp)
+dtest = xgb.DMatrix(data = X_t_ohe, label = resp_t)
+
+params <- list(
+  reg_alpha = 0.1,
+  reg_lambda = 0.9,
+  min_child_weight = 0.5,
+  objective = "reg:squarederror", 
+  eval_metric = "rmse",            
+  max_depth = 3,
+  eta = 0.05
+)
+
+watchlist <- list(train = dtrain, eval = dtest)
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 200,
+  watchlist = watchlist,
+  early_stopping_rounds = 10
+)
+
+predictions <- predict(xgb_model, newdata = dtest)
+
+# Evaluation
+mse <- mse(validation_set$Min.Delay, predictions)
+cat("Test MSE:", mse, "\n")
+
+# R²：
+sst <- sum((resp_t - mean(resp_t))^2)
+ssr <- sum((resp_t - predictions)^2)
+r2 <- 1 - ssr / sst
+cat("Test R²:", r2, "\n")
+
+history <- xgb_model$evaluation_log
+ggplot(history, aes(x = iter)) +
+    geom_line(aes(y = train_rmse, color = "Train RMSE")) +
+    geom_line(aes(y = eval_rmse, color = "Test RMSE")) +
+    labs(title = "XGBoost Training Process", x = "Iteration", y = "RMSE") +
+    scale_color_manual(values = c("Train RMSE" = "blue", "Test RMSE" = "red")) +
+    theme_minimal()
+
+importance_matrix <- xgb.importance(model = xgb_model)
+
+xgb.ggplot.importance(importance_matrix)
+```
